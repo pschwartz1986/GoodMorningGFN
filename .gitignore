@@ -55,6 +55,7 @@ Thumbs.db
 *.jpg
 *.jpeg
 
-## Configuration files with secrets
-appsettings*.json
+## Lokale Config-Overrides (appsettings.json selbst wird getrackt, enthält keine Secrets)
+appsettings.Local.json
+appsettings.*.Local.json
 secrets.json

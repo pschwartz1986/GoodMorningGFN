@@ -3,35 +3,56 @@ using static Microsoft.Playwright.Playwright;
 using System.Text;
 using System.IO;
 using System.Diagnostics;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
+using GoodMorningGFN.Configuration;
+using GoodMorningGFN.Constants;
+using GoodMorningGFN.Logging;
+using GoodMorningGFN.Models;
+using GoodMorningGFN.Policies;
 
 namespace GoodMorningGFN;
 
 static class Program
 {
-    private const string GfnStartUrl = "https://lernplattform.gfn.de/";
-
     [STAThread]
     static async Task Main(string[] args)
     {
         Console.OutputEncoding = Encoding.UTF8;
 
-        bool DRY_RUN = false;
-        string chromeProfilePath = @"C:\ChromeAutomation";
-        string gfnStartUrl = GfnStartUrl;
-        string anwesenheitUrl = "https://lernplattform.gfn.de/local/anmeldung/anwesenheit.php";
+        var configuration = new ConfigurationBuilder()
+            .SetBasePath(AppDomain.CurrentDomain.BaseDirectory)
+            .AddJsonFile("appsettings.json", optional: false)
+            .AddJsonFile("appsettings.Local.json", optional: true)
+            .Build();
 
-        TimeSpan anmeldenVon = new TimeSpan(7, 30, 0);
-        TimeSpan anmeldenBis = new TimeSpan(9, 0, 0);
-        TimeSpan pruefIntervall = TimeSpan.FromSeconds(5);
+        var options = new GfnOptions();
+        configuration.GetSection("Gfn").Bind(options);
 
+        using var loggerFactory = LoggerFactory.Create(builder =>
+            builder.AddProvider(new SimpleFileLoggerProvider(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "logs"))));
+        var logger = loggerFactory.CreateLogger("GoodMorningGFN");
+        logger.LogInformation("GoodMorningGFN gestartet. DryRun={DryRun}", options.DryRun);
+
+        bool DRY_RUN = options.DryRun;
+        string chromeProfilePath = options.ChromeProfilePath;
+        string gfnStartUrl = options.GfnStartUrl;
+        string anwesenheitUrl = options.AnwesenheitUrl;
+
+        TimeSpan anmeldenVon = options.AnmeldenVon;
+        TimeSpan anmeldenBis = options.AnmeldenBis;
+        TimeSpan beendenAb = options.BeendenAb;
+        TimeSpan pruefIntervall = options.PruefIntervall;
+        string standortSsid = options.StandortSsid;
+        string homeofficeSsid = options.HomeofficeSsid;
+
+        // arbeitsort.txt dient nur als Protokoll (siehe README), nicht als Cache:
+        // Der Arbeitsort wird jeden Tag frisch per WLAN neu ermittelt (siehe [NEUER TAG]-Reset),
+        // sonst bleibt ein einmal falsch erkannter Standort (z. B. "Homeoffice") dauerhaft hängen.
         string arbeitsortPfad = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "arbeitsort.txt");
-        string? aktuellerStandort = null;
 
-        if (File.Exists(arbeitsortPfad))
-        {
-            try { aktuellerStandort = File.ReadAllText(arbeitsortPfad).Trim(); }
-            catch { }
-        }
+        var session = new SessionStatus();
+        var tagesStatus = new TagesStatus();
 
         Console.WriteLine("========================================");
         Console.WriteLine("            GoodMorningGFN");
@@ -40,9 +61,10 @@ static class Program
 
         Console.WriteLine($"[CONFIG] DRY_RUN: {DRY_RUN}");
         Console.WriteLine($"[CONFIG] Anmeldung/Starten erlaubt: {anmeldenVon:hh\\:mm} - {anmeldenBis:hh\\:mm}");
-        Console.WriteLine($"[CONFIG] Beenden ab: 16:30");
+        Console.WriteLine($"[CONFIG] Beenden ab: {beendenAb:hh\\:mm}");
         Console.WriteLine($"[CONFIG] Prüfintervall: {pruefIntervall.TotalSeconds} Sekunden");
         Console.WriteLine($"[CONFIG] Chrome-Profil: {chromeProfilePath}");
+        Console.WriteLine($"[CONFIG] WLAN '{standortSsid}' = Standort, WLAN '{homeofficeSsid}' = Homeoffice, alles andere = unentschieden");
         Console.WriteLine();
 
         try
@@ -64,19 +86,12 @@ static class Program
             IPage page = await GetOrCreatePageAsync(context);
             AttachPageHandlers(page);
 
-            bool firstRun = true;
-            bool? lastLoginState = null;
-            bool zeiterfassungGetriggert = false;
-            DateTime letztePruefungDatum = DateTime.MinValue;
-            bool anwesenheitGeprueft = false;
-            string? anwesenheitStatus = null;
-
             Console.WriteLine("[3] Öffne GFN ...");
             await SafeGotoAsync(page, gfnStartUrl);
 
-            lastLoginState = IsLoginPage(page);
+            session.LastLoginState = IsLoginPage(page);
 
-            if (lastLoginState.Value)
+            if (session.LastLoginState.Value)
             {
                 await page.ScreenshotAsync(new() { Path = "01_loginseite.png", FullPage = true });
                 Console.WriteLine("[OK] Screenshot gespeichert: 01_loginseite.png");
@@ -94,8 +109,8 @@ static class Program
             Console.WriteLine("Q im Terminal = Programm beenden");
             Console.WriteLine("Browser wird vom Skript NICHT geschlossen");
             Console.WriteLine("Login wird immer erlaubt, damit die Prüfung möglich ist");
-            Console.WriteLine("Starten nur zwischen 07:30 und 09:00");
-            Console.WriteLine("Beenden ab 16:30");
+            Console.WriteLine($"Starten nur zwischen {anmeldenVon:hh\\:mm} und {anmeldenBis:hh\\:mm}");
+            Console.WriteLine($"Beenden ab {beendenAb:hh\\:mm}");
             Console.WriteLine("========================================");
             Console.WriteLine();
 
@@ -119,13 +134,10 @@ static class Program
                 TimeSpan uhrzeit = jetzt.TimeOfDay;
                 DateTime heute = jetzt.Date;
 
-                if (letztePruefungDatum != heute)
+                if (tagesStatus.LetztePruefungDatum != heute)
                 {
                     Console.WriteLine($"[NEUER TAG] Reset Tagesstatus für {heute:yyyy-MM-dd}");
-                    zeiterfassungGetriggert = false;
-                    anwesenheitGeprueft = false;
-                    anwesenheitStatus = null;
-                    letztePruefungDatum = heute;
+                    tagesStatus.ResetFuerNeuenTag(heute);
                 }
 
                 Console.WriteLine();
@@ -133,9 +145,9 @@ static class Program
                 Console.WriteLine($"[CHECK] {jetzt:yyyy-MM-dd HH:mm:ss}");
                 Console.WriteLine("========================================");
 
-                if (!string.IsNullOrEmpty(anwesenheitStatus))
+                if (!string.IsNullOrEmpty(tagesStatus.AnwesenheitStatus))
                 {
-                    Console.WriteLine(anwesenheitStatus);
+                    Console.WriteLine(tagesStatus.AnwesenheitStatus);
                 }
 
                 try
@@ -152,7 +164,7 @@ static class Program
 
                     if (currentLoginState)
                     {
-                        if (firstRun || lastLoginState != true)
+                        if (session.FirstRun || session.LastLoginState != true)
                         {
                             Console.WriteLine("[STATUS] Loginseite erkannt.");
                             await page.ScreenshotAsync(new() { Path = "01_loginseite.png", FullPage = true });
@@ -161,7 +173,7 @@ static class Program
 
                         Console.WriteLine("[INFO] Login ist grundsätzlich erlaubt, damit die Zeiterfassung geprüft werden kann.");
                         Console.WriteLine("[INFO] Warte kurz auf Chrome-Autofill ...");
-                        await page.WaitForTimeoutAsync(2500);
+                        await page.WaitForTimeoutAsync(PlaywrightTimeouts.ChromeAutofillWaitMs);
 
                         bool loginButtonGefunden = await TryClickLoginAsync(page, DRY_RUN);
 
@@ -182,8 +194,8 @@ static class Program
                         else
                         {
                             Console.WriteLine("[OK] Login wurde ausgelöst.");
-                            await page.WaitForLoadStateAsync(LoadState.NetworkIdle, new() { Timeout = 30000 });
-                            await page.WaitForTimeoutAsync(1500);
+                            await page.WaitForLoadStateAsync(LoadState.NetworkIdle, new() { Timeout = PlaywrightTimeouts.NetworkIdleTimeoutMs });
+                            await page.WaitForTimeoutAsync(PlaywrightTimeouts.PostActionSettleWaitMs);
 
                             Console.WriteLine($"[URL NACH LOGIN]   {page.Url}");
                             Console.WriteLine($"[TITLE NACH LOGIN] {await page.TitleAsync()}");
@@ -201,22 +213,22 @@ static class Program
                             }
                         }
 
-                        lastLoginState = true;
-                        firstRun = false;
+                        session.LastLoginState = true;
+                        session.FirstRun = false;
                         await WaitNextAsync(pruefIntervall);
                         continue;
                     }
 
                     Console.WriteLine("[STATUS] Bereits auf Startseite.");
 
-                    if (firstRun)
+                    if (session.FirstRun)
                     {
                         await page.ScreenshotAsync(new() { Path = "03_startseite.png", FullPage = true });
                         Console.WriteLine("[OK] Screenshot gespeichert: 03_startseite.png");
                     }
 
-                    lastLoginState = false;
-                    firstRun = false;
+                    session.LastLoginState = false;
+                    session.FirstRun = false;
 
                     await TryOpenBlockDrawerAsync(page);
 
@@ -225,24 +237,27 @@ static class Program
 
                     if (formCount > 0)
                     {
-                        if (!zeiterfassungGetriggert && string.IsNullOrEmpty(aktuellerStandort))
+                        if (!tagesStatus.ZeiterfassungGetriggert && string.IsNullOrEmpty(tagesStatus.AktuellerStandort))
                         {
                             Console.WriteLine("[STATUS] Ermittle Arbeitsort aus WLAN ...");
-                            aktuellerStandort = ErmittleArbeitsortAusWlan();
-                            Console.WriteLine($"[INFO] Auswahl: {aktuellerStandort}");
+                            tagesStatus.AktuellerStandort = ErmittleArbeitsortAusWlan(standortSsid, homeofficeSsid);
+                            Console.WriteLine($"[INFO] Auswahl: {tagesStatus.AktuellerStandort}");
 
-                            try { File.WriteAllText(arbeitsortPfad, aktuellerStandort ?? string.Empty); }
-                            catch { }
+                            try { File.WriteAllText(arbeitsortPfad, tagesStatus.AktuellerStandort ?? string.Empty); }
+                            catch (Exception ex)
+                            {
+                                logger.LogWarning(ex, "arbeitsort.txt konnte nicht geschrieben werden.");
+                            }
                         }
 
-                        if (!zeiterfassungGetriggert && !string.IsNullOrEmpty(aktuellerStandort))
+                        if (!tagesStatus.ZeiterfassungGetriggert && !string.IsNullOrEmpty(tagesStatus.AktuellerStandort))
                         {
-                            await TrySetArbeitsortAsync(page, aktuellerStandort);
+                            await TrySetArbeitsortAsync(page, tagesStatus.AktuellerStandort);
                         }
 
-                        await page.WaitForTimeoutAsync(500);
+                        await page.WaitForTimeoutAsync(PlaywrightTimeouts.ArbeitsortFormSettleWaitMs);
 
-                        bool startFenster = uhrzeit >= anmeldenVon && uhrzeit <= anmeldenBis;
+                        bool startFenster = ZeitfensterPolicy.IstStartenErlaubt(uhrzeit, anmeldenVon, anmeldenBis);
                         if (!startFenster)
                         {
                             Console.WriteLine($"[BLOCKIERT] Starten ist nur zwischen {anmeldenVon:hh\\:mm} und {anmeldenBis:hh\\:mm} erlaubt.");
@@ -263,8 +278,8 @@ static class Program
                                 await submit.Nth(0).ClickAsync();
                                 Console.WriteLine("[OK] Starten wurde geklickt.");
 
-                                await page.WaitForLoadStateAsync(LoadState.NetworkIdle, new() { Timeout = 30000 });
-                                await page.WaitForTimeoutAsync(1500);
+                                await page.WaitForLoadStateAsync(LoadState.NetworkIdle, new() { Timeout = PlaywrightTimeouts.NetworkIdleTimeoutMs });
+                                await page.WaitForTimeoutAsync(PlaywrightTimeouts.PostActionSettleWaitMs);
 
                                 await page.ScreenshotAsync(new() { Path = "04_nach_starten.png", FullPage = true });
                                 Console.WriteLine("[OK] Screenshot gespeichert: 04_nach_starten.png");
@@ -276,17 +291,17 @@ static class Program
                                 if (beendenGefunden)
                                 {
                                     Console.WriteLine("[VERIFIZIERT] Zeiterfassung wurde gestartet.");
-                                    zeiterfassungGetriggert = true;
+                                    tagesStatus.ZeiterfassungGetriggert = true;
 
-                                    if (!DRY_RUN && !anwesenheitGeprueft)
+                                    if (!DRY_RUN && !tagesStatus.AnwesenheitGeprueft)
                                     {
                                         Console.WriteLine("[INFO] Prüfe Anwesenheitseintrag nach Start ...");
-                                        anwesenheitStatus = await TryGetTodaysAttendanceStatusAsync(page, anwesenheitUrl);
-                                        anwesenheitGeprueft = true;
-                                        
-                                        if (!string.IsNullOrEmpty(anwesenheitStatus))
+                                        tagesStatus.AnwesenheitStatus = await TryGetTodaysAttendanceStatusAsync(page, anwesenheitUrl, gfnStartUrl);
+                                        tagesStatus.AnwesenheitGeprueft = true;
+
+                                        if (!string.IsNullOrEmpty(tagesStatus.AnwesenheitStatus))
                                         {
-                                            Console.WriteLine(anwesenheitStatus);
+                                            Console.WriteLine(tagesStatus.AnwesenheitStatus);
                                         }
                                     }
                                 }
@@ -323,7 +338,7 @@ static class Program
                             if (hatStartzeit && hatEndzeit)
                             {
                                 Console.WriteLine("[INFO] Zeiterfassung ist beendet. Block zeigt nur Start-/Endzeit an.");
-                                zeiterfassungGetriggert = false;
+                                tagesStatus.ZeiterfassungGetriggert = false;
                             }
                             else
                             {
@@ -338,17 +353,14 @@ static class Program
                     string buttonText = (await button.InnerTextAsync()).Trim();
                     string buttonValue = await button.GetAttributeAsync("value") ?? string.Empty;
 
-                    bool istStarten = buttonText.Contains("Starten", StringComparison.OrdinalIgnoreCase) ||
-                                      buttonValue.Contains("Starten", StringComparison.OrdinalIgnoreCase);
-                    bool istBeenden = buttonText.Contains("Beenden", StringComparison.OrdinalIgnoreCase) ||
-                                      buttonValue.Contains("Beenden", StringComparison.OrdinalIgnoreCase);
+                    ZeiterfassungAction erkannteAktion = ButtonTextErkennung.Erkenne(buttonText, buttonValue);
 
-                    if (istStarten)
+                    if (erkannteAktion == ZeiterfassungAction.Starten)
                     {
                         Console.WriteLine("[STATUS] Zeiterfassung ist offenbar NICHT gestartet.");
                         Console.WriteLine("[AKTION] Mögliche Aktion: STARTEN");
 
-                        bool startFenster = uhrzeit >= anmeldenVon && uhrzeit <= anmeldenBis;
+                        bool startFenster = ZeitfensterPolicy.IstStartenErlaubt(uhrzeit, anmeldenVon, anmeldenBis);
 
                         if (!startFenster)
                         {
@@ -365,8 +377,8 @@ static class Program
                                 await button.ClickAsync();
                                 Console.WriteLine("[OK] Starten wurde geklickt.");
 
-                                await page.WaitForLoadStateAsync(LoadState.NetworkIdle, new() { Timeout = 30000 });
-                                await page.WaitForTimeoutAsync(1500);
+                                await page.WaitForLoadStateAsync(LoadState.NetworkIdle, new() { Timeout = PlaywrightTimeouts.NetworkIdleTimeoutMs });
+                                await page.WaitForTimeoutAsync(PlaywrightTimeouts.PostActionSettleWaitMs);
 
                                 await page.ScreenshotAsync(new() { Path = "04_nach_starten.png", FullPage = true });
                                 Console.WriteLine("[OK] Screenshot gespeichert: 04_nach_starten.png");
@@ -384,17 +396,17 @@ static class Program
                                 if (istJetztBeenden)
                                 {
                                     Console.WriteLine("[VERIFIZIERT] Zeiterfassung wurde gestartet.");
-                                    zeiterfassungGetriggert = true;
+                                    tagesStatus.ZeiterfassungGetriggert = true;
 
-                                    if (!DRY_RUN && !anwesenheitGeprueft)
+                                    if (!DRY_RUN && !tagesStatus.AnwesenheitGeprueft)
                                     {
                                         Console.WriteLine("[INFO] Prüfe Anwesenheitseintrag nach Start ...");
-                                        anwesenheitStatus = await TryGetTodaysAttendanceStatusAsync(page, anwesenheitUrl);
-                                        anwesenheitGeprueft = true;
-                                        
-                                        if (!string.IsNullOrEmpty(anwesenheitStatus))
+                                        tagesStatus.AnwesenheitStatus = await TryGetTodaysAttendanceStatusAsync(page, anwesenheitUrl, gfnStartUrl);
+                                        tagesStatus.AnwesenheitGeprueft = true;
+
+                                        if (!string.IsNullOrEmpty(tagesStatus.AnwesenheitStatus))
                                         {
-                                            Console.WriteLine(anwesenheitStatus);
+                                            Console.WriteLine(tagesStatus.AnwesenheitStatus);
                                         }
                                     }
                                 }
@@ -405,28 +417,28 @@ static class Program
                             }
                         }
                     }
-                    else if (istBeenden)
+                    else if (erkannteAktion == ZeiterfassungAction.Beenden)
                     {
                         Console.WriteLine("[STATUS] Zeiterfassung läuft offenbar.");
                         Console.WriteLine("[AKTION] Mögliche Aktion: BEENDEN");
 
-                        if (!anwesenheitGeprueft && !DRY_RUN)
+                        if (!tagesStatus.AnwesenheitGeprueft && !DRY_RUN)
                         {
                             Console.WriteLine("[INFO] Prüfe Anwesenheitseintrag während laufender Zeiterfassung ...");
-                            anwesenheitStatus = await TryGetTodaysAttendanceStatusAsync(page, anwesenheitUrl);
-                            anwesenheitGeprueft = true;
+                            tagesStatus.AnwesenheitStatus = await TryGetTodaysAttendanceStatusAsync(page, anwesenheitUrl, gfnStartUrl);
+                            tagesStatus.AnwesenheitGeprueft = true;
 
-                            if (!string.IsNullOrEmpty(anwesenheitStatus))
+                            if (!string.IsNullOrEmpty(tagesStatus.AnwesenheitStatus))
                             {
-                                Console.WriteLine(anwesenheitStatus);
+                                Console.WriteLine(tagesStatus.AnwesenheitStatus);
                             }
                         }
 
-                        bool endeFenster = uhrzeit >= new TimeSpan(16, 30, 0);
+                        bool endeFenster = ZeitfensterPolicy.IstBeendenErlaubt(uhrzeit, beendenAb);
 
                         if (!endeFenster)
                         {
-                            Console.WriteLine("[BLOCKIERT] Beenden ist erst ab 16:30 erlaubt.");
+                            Console.WriteLine($"[BLOCKIERT] Beenden ist erst ab {beendenAb:hh\\:mm} erlaubt.");
                         }
                         else
                         {
@@ -439,8 +451,8 @@ static class Program
                                 await button.ClickAsync();
                                 Console.WriteLine("[OK] Beenden wurde geklickt.");
 
-                                await page.WaitForLoadStateAsync(LoadState.NetworkIdle, new() { Timeout = 30000 });
-                                await page.WaitForTimeoutAsync(1500);
+                                await page.WaitForLoadStateAsync(LoadState.NetworkIdle, new() { Timeout = PlaywrightTimeouts.NetworkIdleTimeoutMs });
+                                await page.WaitForTimeoutAsync(PlaywrightTimeouts.PostActionSettleWaitMs);
 
                                 await page.ScreenshotAsync(new() { Path = "05_nach_beenden.png", FullPage = true });
                                 Console.WriteLine("[OK] Screenshot gespeichert: 05_nach_beenden.png");
@@ -451,7 +463,7 @@ static class Program
                                 if (keineButtonsMehr)
                                 {
                                     Console.WriteLine("[VERIFIZIERT] Zeiterfassung wurde beendet.");
-                                    zeiterfassungGetriggert = false;
+                                    tagesStatus.ZeiterfassungGetriggert = false;
                                 }
                                 else
                                 {
@@ -627,7 +639,7 @@ static class Program
             {
                 await drawerButton.Nth(0).ClickAsync();
                 Console.WriteLine("[OK] Blockleisten-Button geklickt.");
-                await page.WaitForTimeoutAsync(1000);
+                await page.WaitForTimeoutAsync(PlaywrightTimeouts.DrawerToggleWaitMs);
             }
             else
             {
@@ -672,7 +684,7 @@ static class Program
             }
 
             await radio.Nth(0).ClickAsync();
-            await page.WaitForTimeoutAsync(300);
+            await page.WaitForTimeoutAsync(PlaywrightTimeouts.RadioClickSettleWaitMs);
 
             bool isChecked = await radio.Nth(0).IsCheckedAsync();
             Console.WriteLine($"[OK] Arbeitsort gesetzt: {standort} (checked={isChecked})");
@@ -692,7 +704,7 @@ static class Program
         await Task.Delay(interval);
     }
 
-    static string? ErmittleArbeitsortAusWlan()
+    static string? ErmittleArbeitsortAusWlan(string standortSsid, string homeofficeSsid)
     {
         try
         {
@@ -711,31 +723,38 @@ static class Program
             string output = process.StandardOutput.ReadToEnd();
             process.WaitForExit();
 
-            var match = System.Text.RegularExpressions.Regex.Match(
-                output,
-                @"SSID\s*:\s*(.+)",
-                System.Text.RegularExpressions.RegexOptions.IgnoreCase
-            );
+            string? ssid = WlanSsidParser.ExtractSsid(output);
 
-            if (match.Success)
+            if (ssid != null)
             {
-                string ssid = match.Groups[1].Value.Trim();
                 Console.WriteLine($"[INFO] Aktuelles WLAN: {ssid}");
-                return ssid.StartsWith("GFN", StringComparison.OrdinalIgnoreCase) ? "Standort" : "Homeoffice";
+
+                Standort standort = StandortMapping.VonSsid(ssid, standortSsid, homeofficeSsid);
+                if (standort == Standort.Unbekannt)
+                {
+                    Console.WriteLine($"[WARN] SSID '{ssid}' ist keines der bekannten Netzwerke ('{standortSsid}' = Standort, '{homeofficeSsid}' = Homeoffice). Arbeitsort bleibt unentschieden, keine automatische Auswahl.");
+                }
+
+                return StandortMapping.ZuLegacyString(standort);
             }
+
+            Console.WriteLine("[WARN] Keine WLAN-SSID gefunden (z. B. kein WLAN aktiv/verbunden, oder LAN-Kabel statt WLAN). Arbeitsort kann nicht ermittelt werden.");
         }
-        catch { }
+        catch (Exception ex)
+        {
+            Console.WriteLine("[WARN] WLAN-Erkennung fehlgeschlagen: " + ex.Message);
+        }
 
         return null;
     }
 
-    static async Task<string?> TryGetTodaysAttendanceStatusAsync(IPage page, string anwesenheitUrl)
+    static async Task<string?> TryGetTodaysAttendanceStatusAsync(IPage page, string anwesenheitUrl, string gfnStartUrl)
     {
         try
         {
             await SafeGotoAsync(page, anwesenheitUrl);
-            await page.WaitForLoadStateAsync(LoadState.NetworkIdle, new() { Timeout = 30000 });
-            await page.WaitForTimeoutAsync(2000);
+            await page.WaitForLoadStateAsync(LoadState.NetworkIdle, new() { Timeout = PlaywrightTimeouts.NetworkIdleTimeoutMs });
+            await page.WaitForTimeoutAsync(PlaywrightTimeouts.AttendancePageSettleWaitMs);
 
             string heute = DateTime.Now.ToString("dd.MM.yyyy");
             
@@ -766,18 +785,18 @@ static class Program
                         string loginzeit = (await cells.Nth(2).InnerTextAsync()).Trim();
                         string logoutzeit = (await cells.Nth(3).InnerTextAsync()).Trim();
                         
-                        await SafeGotoAsync(page, GfnStartUrl);
+                        await SafeGotoAsync(page, gfnStartUrl);
                         return $"[ANWESENHEIT] {heute} | {standort} | Login: {loginzeit} | Logout: {logoutzeit}";
                     }
                 }
             }
 
-            await SafeGotoAsync(page, GfnStartUrl);
+            await SafeGotoAsync(page, gfnStartUrl);
             return $"[STATUS] Heute ({heute}): Noch kein Eintrag in der Anwesenheitsliste.";
         }
         catch (Exception ex)
         {
-            await SafeGotoAsync(page, GfnStartUrl);
+            await SafeGotoAsync(page, gfnStartUrl);
             return "[WARN] Anwesenheitsstatus konnte nicht ermittelt werden: " + ex.Message;
         }
     }
